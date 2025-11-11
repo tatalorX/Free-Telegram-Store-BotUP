@@ -678,7 +678,7 @@ def create_payment_address(amount, price_currency, pay_currency, description='Pa
         'Content-Type': 'application/json'
     }
     data = {
-        'price_amount': amount,
+        'price_amount': float(amount),
         'price_currency': price_currency.lower(),
         'pay_currency': pay_currency.lower(),
         'order_description': description
@@ -742,27 +742,53 @@ def process_wallet_top_up(message):
     amount = amount.quantize(Decimal('0.01'))
     CreateDatas.AddAuser(user_id, username)
 
-    ltc_amount = get_ltc_amount(float(amount), store_currency)
+    fiat_amount = float(amount)
+    ltc_amount = get_ltc_amount(fiat_amount, store_currency)
     if not ltc_amount:
         bot.send_message(message.chat.id, "Unable to calculate LTC amount right now. Please try again later.",
                          reply_markup=keyboard)
         return
 
     order_reference = f"wallet_{user_id}_{int(time.time())}"
-    payment_address, payment_id = create_payment_address(
-        ltc_amount,
-        'ltc',
-        'ltc',
-        description=f'Wallet top-up for {user_id}',
-        order_id=order_reference
-    )
+    payment_address = None
+    payment_id = None
+    max_attempts = 5
+    attempt = 0
 
-    if not payment_address or not payment_id:
+    while attempt < max_attempts:
+        attempt_order_id = f"{order_reference}_{attempt}" if attempt else order_reference
+        candidate_address, candidate_payment_id = create_payment_address(
+            fiat_amount,
+            store_currency,
+            'ltc',
+            description=f'Wallet top-up for {user_id}',
+            order_id=attempt_order_id
+        )
+
+        if not candidate_address or not candidate_payment_id:
+            payment_address, payment_id = candidate_address, candidate_payment_id
+            break
+
+        if not CreateDatas.WalletAddressExists(candidate_address, 'ltc'):
+            payment_address, payment_id = candidate_address, candidate_payment_id
+            break
+
+        logger.warning(
+            "Duplicate LTC payment address %s detected for user %s. Retrying generation (attempt %s/%s).",
+            candidate_address,
+            user_id,
+            attempt + 1,
+            max_attempts
+        )
+        attempt += 1
+        time.sleep(0.5)
+
+    if not payment_address or not payment_id or CreateDatas.WalletAddressExists(payment_address, 'ltc'):
         bot.send_message(message.chat.id, "Unable to create a payment invoice. Please try again later.",
                          reply_markup=keyboard)
         return
 
-    created = CreateDatas.AddWalletTopUp(user_id, username, float(amount), ltc_amount, 'ltc', payment_id, payment_address)
+    created = CreateDatas.AddWalletTopUp(user_id, username, fiat_amount, ltc_amount, 'ltc', payment_id, payment_address)
     if not created:
         bot.send_message(message.chat.id,
                          "You already have this payment pending or an error occurred. Please use the status button to check.",
@@ -777,12 +803,17 @@ def process_wallet_top_up(message):
     bot.send_message(
         message.chat.id,
         (f"Send exactly {Decimal(str(ltc_amount)).quantize(Decimal('0.00000001'))} LTC "
-         f"(approximately {amount} {store_currency}) to the following address:"),
+         f"(approximately {amount} {store_currency}) to the following temporary address:"),
         reply_markup=reply_keyboard
     )
     bot.send_message(message.chat.id, f"`{payment_address}`", reply_markup=reply_keyboard, parse_mode='Markdown')
-    bot.send_message(message.chat.id, "After payment, tap on *Check LTC Payment Status ⌛* to confirm.",
-                     reply_markup=reply_keyboard, parse_mode='Markdown')
+    bot.send_message(
+        message.chat.id,
+        ("This address is temporary and will change after your payment is processed."
+         "\nAfter payment, tap on *Check LTC Payment Status ⌛* to confirm."),
+        reply_markup=reply_keyboard,
+        parse_mode='Markdown'
+    )
 
 
 @bot.message_handler(content_types=["text"], func=lambda message: message.text == "Check LTC Payment Status ⌛")
@@ -803,7 +834,7 @@ def check_wallet_top_up_status(message):
 
         normalized_status = payment_status.lower()
         if normalized_status == 'finished':
-            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'finished')
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'finished', 'used')
             CreateDatas.IncrementUserWallet(user_id, float(fiat_amount))
             new_balance = GetDataFromDB.GetUserWalletInDB(user_id)
             bot.send_message(
@@ -812,14 +843,14 @@ def check_wallet_top_up_status(message):
                  f"Your new balance is {new_balance} {store_currency}.")
             )
         elif normalized_status in ['waiting', 'confirming', 'sending']:
-            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'waiting')
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'waiting', 'temporary')
             bot.send_message(
                 message.chat.id,
                 (f"Payment {payment_id} is still processing ({payment_status}).\n"
                  "Please check again in a few minutes.")
             )
         else:
-            CreateDatas.UpdateWalletTopUpStatus(payment_id, normalized_status)
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, normalized_status, 'expired')
             bot.send_message(
                 message.chat.id,
                 (f"Payment {payment_id} returned status '{payment_status}'.\n"
