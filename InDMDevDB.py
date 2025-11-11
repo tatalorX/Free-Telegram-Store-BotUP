@@ -14,6 +14,10 @@ db_connection.row_factory = sqlite3.Row  # Enable dict-like access to rows
 cursor = db_connection.cursor()
 db_lock = threading.Lock()
 
+# Backwards compatibility handles
+DBConnection = db_connection
+connected = cursor
+
 class CreateTables:
     """Database table creation and management"""
     
@@ -96,10 +100,26 @@ class CreateTables:
                     activated TEXT DEFAULT 'NO',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )""")
-                
+
+                # Create WalletTopUpTable
+                cursor.execute("""CREATE TABLE IF NOT EXISTS WalletTopUpTable(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    fiat_amount REAL NOT NULL,
+                    crypto_amount REAL NOT NULL,
+                    crypto_currency TEXT NOT NULL,
+                    payment_id TEXT UNIQUE NOT NULL,
+                    payment_address TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES ShopUserTable(user_id)
+                )""")
+
                 db_connection.commit()
                 logger.info("All database tables created successfully")
-                
+
         except Exception as e:
             logger.error(f"Error creating database tables: {e}")
             db_connection.rollback()
@@ -280,6 +300,79 @@ class CreateDatas:
         connected.execute(AddData)
         DBConnection.commit()
 
+    @staticmethod
+    def AddWalletTopUp(user_id, username, fiat_amount, crypto_amount, crypto_currency,
+                       payment_id, payment_address):
+        """Create a wallet top-up record"""
+        try:
+            with db_lock:
+                cursor.execute("""
+                    INSERT OR IGNORE INTO WalletTopUpTable
+                    (user_id, username, fiat_amount, crypto_amount, crypto_currency,
+                     payment_id, payment_address, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (user_id, username, fiat_amount, crypto_amount, crypto_currency,
+                      payment_id, payment_address))
+                db_connection.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error adding wallet top-up for {user_id}: {e}")
+            db_connection.rollback()
+            return False
+
+    @staticmethod
+    def UpdateWalletTopUpStatus(payment_id, status):
+        """Update wallet top-up status"""
+        try:
+            with db_lock:
+                cursor.execute("""
+                    UPDATE WalletTopUpTable
+                    SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE payment_id = ?
+                """, (status, payment_id))
+                db_connection.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error updating wallet top-up {payment_id}: {e}")
+            db_connection.rollback()
+            return False
+
+    @staticmethod
+    def IncrementUserWallet(user_id, amount):
+        """Increment user wallet balance"""
+        try:
+            with db_lock:
+                cursor.execute("""
+                    UPDATE ShopUserTable
+                    SET wallet = COALESCE(wallet, 0) + ?
+                    WHERE user_id = ?
+                """, (amount, user_id))
+                if cursor.rowcount == 0:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO ShopUserTable (user_id, username, wallet) VALUES (?, ?, ?)",
+                        (user_id, None, amount)
+                    )
+                db_connection.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error incrementing wallet for user {user_id}: {e}")
+            db_connection.rollback()
+            return False
+
+    @staticmethod
+    def GetWalletTopUp(payment_id):
+        """Fetch wallet top-up by payment ID"""
+        try:
+            with db_lock:
+                cursor.execute(
+                    "SELECT * FROM WalletTopUpTable WHERE payment_id = ?",
+                    (payment_id,)
+                )
+                return cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Error fetching wallet top-up {payment_id}: {e}")
+            return None
+
     def UpdateProductName(productname, productnumber):
         try:
             connected.execute(f"UPDATE ShopProductTable SET productname = ? WHERE productnumber = ?", (productname, productnumber))
@@ -360,7 +453,15 @@ class GetDataFromDB:
             with db_lock:
                 cursor.execute("SELECT wallet FROM ShopUserTable WHERE user_id = ?", (userid,))
                 result = cursor.fetchone()
-                return result[0] if result else 0
+                if result is None:
+                    return 0
+                value = result[0]
+                if value is None:
+                    return 0
+                try:
+                    return round(float(value), 2)
+                except (TypeError, ValueError):
+                    return 0
         except Exception as e:
             logger.error(f"Error getting user wallet for {userid}: {e}")
             return 0
@@ -728,6 +829,36 @@ class GetDataFromDB:
                 return None
         except Exception as e:
             print(e)
+            return None
+
+    @staticmethod
+    def GetPendingWalletTopUps(user_id):
+        """Get pending wallet top-ups for a user"""
+        try:
+            with db_lock:
+                cursor.execute("""
+                    SELECT payment_id, fiat_amount, crypto_amount, crypto_currency, payment_address, status
+                    FROM WalletTopUpTable
+                    WHERE user_id = ? AND status IN ('pending', 'waiting')
+                """, (user_id,))
+                return cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error fetching wallet top-ups for {user_id}: {e}")
+            return []
+
+    @staticmethod
+    def GetProcessedWalletTopUp(payment_id):
+        """Get processed wallet top-up"""
+        try:
+            with db_lock:
+                cursor.execute("""
+                    SELECT status
+                    FROM WalletTopUpTable
+                    WHERE payment_id = ?
+                """, (payment_id,))
+                return cursor.fetchone()
+        except Exception as e:
+            logger.error(f"Error fetching wallet top-up status {payment_id}: {e}")
             return None
 
     def GetAllPaymentMethodsInDB():

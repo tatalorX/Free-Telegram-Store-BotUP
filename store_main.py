@@ -1,5 +1,6 @@
 import flask
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 import requests
 import time
 import logging
@@ -106,8 +107,10 @@ def create_main_keyboard():
     key1 = types.KeyboardButton(text="Shop Items 🛒")
     key2 = types.KeyboardButton(text="My Orders 🛍")
     key3 = types.KeyboardButton(text="Support 📞")
+    key4 = types.KeyboardButton(text="Add Funds 💵")
     keyboard.add(key1)
     keyboard.add(key2, key3)
+    keyboard.add(key4)
     return keyboard
 
 keyboard = create_main_keyboard()
@@ -250,9 +253,11 @@ def admin_switch_user(message):
         key1 = types.KeyboardButton(text="Shop Items 🛒")
         key2 = types.KeyboardButton(text="My Orders 🛍")
         key3 = types.KeyboardButton(text="Support 📞")
+        key5 = types.KeyboardButton(text="Add Funds 💵")
         key4 = types.KeyboardButton(text="Home 🏘")
         keyboard.add(key1)
         keyboard.add(key2, key3)
+        keyboard.add(key5)
         keyboard.add(key4)
         user_data = GetDataFromDB.GetUserWalletInDB(id)
     else:
@@ -261,9 +266,11 @@ def admin_switch_user(message):
         key1 = types.KeyboardButton(text="Shop Items 🛒")
         key2 = types.KeyboardButton(text="My Orders 🛍")
         key3 = types.KeyboardButton(text="Support 📞")
+        key5 = types.KeyboardButton(text="Add Funds 💵")
         key4 = types.KeyboardButton(text="Home 🏘")
         keyboard.add(key1)
         keyboard.add(key2, key3)
+        keyboard.add(key5)
         keyboard.add(key4)
         user_data = GetDataFromDB.GetUserWalletInDB(id)
     bot.send_photo(chat_id=message.chat.id, photo="https://i.ibb.co/9vctwpJ/IMG-1235.jpg", caption=f"Dear {user_type},\n\nYour Wallet Balance: $ {user_data} 💰 \n\nBrowse our products, make purchases, and enjoy fast delivery! \nType /browse to start shopping. \n\n💬 Need help? \nContact our support team anytime.", reply_markup=keyboard)
@@ -622,42 +629,72 @@ def shop_items(message):
     UserOperations.shop_items(message)
 
 
-# Dictionary to store Bitcoint payment data
+# Dictionary to store Bitcoin payment data
 bitcoin_payment_data = {}
 
-# Function to get BTC amount for the given fiat amount
-def get_btc_amount(fiat_amount, currency):
-    url = f'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={currency.lower()}'
-    response = requests.get(url)
-    if response.status_code == 200:
-        price = response.json()['bitcoin'][currency.lower()]
-        btc_amount = int(fiat_amount) / int(price)
-        return btc_amount
-    else:
-        print(f"Error fetching BTC price: {response.status_code} - {response.text}")
+CRYPTO_PRICE_IDS = {
+    'btc': 'bitcoin',
+    'ltc': 'litecoin'
+}
+
+
+def get_crypto_amount(fiat_amount, currency, crypto_symbol):
+    """Convert fiat amount to the target crypto amount using CoinGecko"""
+    try:
+        crypto_id = CRYPTO_PRICE_IDS.get(crypto_symbol.lower())
+        if not crypto_id:
+            logger.error(f"Unsupported crypto symbol: {crypto_symbol}")
+            return None
+        url = f'https://api.coingecko.com/api/v3/simple/price?ids={crypto_id}&vs_currencies={currency.lower()}'
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            price = response.json()[crypto_id][currency.lower()]
+            amount_decimal = Decimal(str(fiat_amount)) / Decimal(str(price))
+            return float(round(amount_decimal, 8))
+        logger.error(f"Error fetching {crypto_symbol.upper()} price: {response.status_code} - {response.text}")
+        return None
+    except (requests.RequestException, KeyError, InvalidOperation) as error:
+        logger.error(f"Error converting {currency} to {crypto_symbol.upper()}: {error}")
         return None
 
-# Function to create a new payment
-def create_payment_address(btc_amount):
+
+def get_btc_amount(fiat_amount, currency):
+    return get_crypto_amount(fiat_amount, currency, 'btc')
+
+
+def get_ltc_amount(fiat_amount, currency):
+    return get_crypto_amount(fiat_amount, currency, 'ltc')
+
+
+def create_payment_address(amount, price_currency, pay_currency, description='Payment for Order', order_id=None):
+    """Create a payment address via the NowPayments API"""
+    if not NOWPAYMENTS_API_KEY:
+        logger.error("NOWPayments API key is not configured")
+        return None, None
+
     url = 'https://api.nowpayments.io/v1/payment'
     headers = {
         'x-api-key': NOWPAYMENTS_API_KEY,
         'Content-Type': 'application/json'
     }
     data = {
-        'price_amount': btc_amount,
-        'price_currency': 'btc',
-        'pay_currency': 'btc',
-        'ipn_callback_url': 'https://api.nowpayments.io/ipn',
-        'order_id': '5555555555',
-        'order_description': 'Payment for Order'
+        'price_amount': amount,
+        'price_currency': price_currency.lower(),
+        'pay_currency': pay_currency.lower(),
+        'order_description': description
     }
-    response = requests.post(url, json=data, headers=headers)
-    if response.status_code == 201:
-        return response.json()['pay_address'], response.json()['payment_id']
-    else:
-        print(f"Error creating payment address: {response.status_code} - {response.text}")
-        return None, None
+    if order_id:
+        data['order_id'] = str(order_id)
+
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=15)
+        if response.status_code == 201:
+            payload = response.json()
+            return payload.get('pay_address'), payload.get('payment_id')
+        logger.error(f"Error creating payment address: {response.status_code} - {response.text}")
+    except requests.RequestException as error:
+        logger.error(f"Request error when creating payment address: {error}")
+    return None, None
     
 # Function to check the payment status
 def check_payment_status(payment_id):
@@ -671,6 +708,125 @@ def check_payment_status(payment_id):
     else:
         print(f"Error checking payment status: {response.status_code} - {response.text}")
         return None
+
+
+# Command handler to add funds using Litecoin
+@bot.message_handler(content_types=["text"], func=lambda message: message.text == "Add Funds 💵")
+def initiate_wallet_top_up(message):
+    try:
+        prompt = (f"Enter the amount in {store_currency} you would like to add to your wallet."
+                  "\n\nExample: 15 or 19.99")
+        msg = bot.send_message(message.chat.id, prompt, reply_markup=types.ReplyKeyboardRemove())
+        bot.register_next_step_handler(msg, process_wallet_top_up)
+    except Exception as error:
+        logger.error(f"Error initiating wallet top-up: {error}")
+        bot.send_message(message.chat.id, "Unable to start wallet funding at the moment. Please try again later.",
+                         reply_markup=keyboard)
+
+
+def process_wallet_top_up(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    amount_text = message.text.strip()
+
+    try:
+        amount = Decimal(amount_text.replace(',', '.'))
+    except InvalidOperation:
+        bot.send_message(message.chat.id, "Please send a valid number for the amount.", reply_markup=keyboard)
+        return
+
+    if amount <= 0:
+        bot.send_message(message.chat.id, "Amount must be greater than zero.", reply_markup=keyboard)
+        return
+
+    amount = amount.quantize(Decimal('0.01'))
+    CreateDatas.AddAuser(user_id, username)
+
+    ltc_amount = get_ltc_amount(float(amount), store_currency)
+    if not ltc_amount:
+        bot.send_message(message.chat.id, "Unable to calculate LTC amount right now. Please try again later.",
+                         reply_markup=keyboard)
+        return
+
+    order_reference = f"wallet_{user_id}_{int(time.time())}"
+    payment_address, payment_id = create_payment_address(
+        ltc_amount,
+        'ltc',
+        'ltc',
+        description=f'Wallet top-up for {user_id}',
+        order_id=order_reference
+    )
+
+    if not payment_address or not payment_id:
+        bot.send_message(message.chat.id, "Unable to create a payment invoice. Please try again later.",
+                         reply_markup=keyboard)
+        return
+
+    created = CreateDatas.AddWalletTopUp(user_id, username, float(amount), ltc_amount, 'ltc', payment_id, payment_address)
+    if not created:
+        bot.send_message(message.chat.id,
+                         "You already have this payment pending or an error occurred. Please use the status button to check.",
+                         reply_markup=keyboard)
+        return
+
+    reply_keyboard = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+    reply_keyboard.row_width = 2
+    reply_keyboard.add(types.KeyboardButton(text="Check LTC Payment Status ⌛"))
+    reply_keyboard.add(types.KeyboardButton(text="Home 🏘"))
+
+    bot.send_message(
+        message.chat.id,
+        (f"Send exactly {Decimal(str(ltc_amount)).quantize(Decimal('0.00000001'))} LTC "
+         f"(approximately {amount} {store_currency}) to the following address:"),
+        reply_markup=reply_keyboard
+    )
+    bot.send_message(message.chat.id, f"`{payment_address}`", reply_markup=reply_keyboard, parse_mode='Markdown')
+    bot.send_message(message.chat.id, "After payment, tap on *Check LTC Payment Status ⌛* to confirm.",
+                     reply_markup=reply_keyboard, parse_mode='Markdown')
+
+
+@bot.message_handler(content_types=["text"], func=lambda message: message.text == "Check LTC Payment Status ⌛")
+def check_wallet_top_up_status(message):
+    user_id = message.from_user.id
+    pending = GetDataFromDB.GetPendingWalletTopUps(user_id)
+
+    if not pending:
+        bot.send_message(message.chat.id, "You do not have any pending LTC top-ups.", reply_markup=keyboard)
+        return
+
+    for payment_id, fiat_amount, crypto_amount, crypto_currency, payment_address, status in pending:
+        payment_status = check_payment_status(payment_id)
+        if not payment_status:
+            bot.send_message(message.chat.id,
+                             f"Unable to retrieve payment status for {payment_id}. Please try again later.")
+            continue
+
+        normalized_status = payment_status.lower()
+        if normalized_status == 'finished':
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'finished')
+            CreateDatas.IncrementUserWallet(user_id, float(fiat_amount))
+            new_balance = GetDataFromDB.GetUserWalletInDB(user_id)
+            bot.send_message(
+                message.chat.id,
+                (f"✅ Payment confirmed! Added {fiat_amount} {store_currency} to your wallet.\n"
+                 f"Your new balance is {new_balance} {store_currency}.")
+            )
+        elif normalized_status in ['waiting', 'confirming', 'sending']:
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'waiting')
+            bot.send_message(
+                message.chat.id,
+                (f"Payment {payment_id} is still processing ({payment_status}).\n"
+                 "Please check again in a few minutes.")
+            )
+        else:
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, normalized_status)
+            bot.send_message(
+                message.chat.id,
+                (f"Payment {payment_id} returned status '{payment_status}'.\n"
+                 "If you sent the funds, please contact support with this reference.")
+            )
+
+    bot.send_message(message.chat.id, "Done ✅", reply_markup=keyboard)
 
 
 # Command handler to pay with Bitcoin
@@ -692,8 +848,15 @@ def bitcoin_pay_command(message):
             try:
                 fiat_amount = new_order[2]
                 btc_amount = get_btc_amount(fiat_amount, store_currency)
+                ordernumber = random.randint(10000,99999)
                 if btc_amount:
-                    payment_address, payment_id = create_payment_address(btc_amount)
+                    payment_address, payment_id = create_payment_address(
+                        btc_amount,
+                        'btc',
+                        'btc',
+                        description=f'Product order {ordernumber}',
+                        order_id=f'order_{ordernumber}'
+                    )
                     if payment_address and payment_id:
                         bitcoin_payment_data[message.from_user.id] = {
                             'payment_id': payment_id,
@@ -705,7 +868,6 @@ def bitcoin_pay_command(message):
                         try:
                             now = datetime.now()
                             orderdate = now.strftime("%Y-%m-%d %H:%M:%S")
-                            ordernumber = random.randint(10000,99999)
                             paidmethod = "NO"
                             add_key = "NIL"
                             productdownloadlink = GetDataFromDB.GetProductDownloadLink(new_orders[0])
