@@ -4,9 +4,13 @@ Configuration settings for the Telegram Store Bot
 
 import os
 import logging
+from typing import Dict, Optional
+
 from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables from the local configuration file so the project
+# can be configured through environment variables in production while keeping a
+# convenient `.env` file for development.
 load_dotenv('config.env')
 
 class BotConfig:
@@ -19,14 +23,16 @@ class BotConfig:
     # Store Settings
     STORE_CURRENCY = os.getenv('STORE_CURRENCY', 'USD')
     STORE_NAME = os.getenv('STORE_NAME', 'Telegram Store')
-    
+
     # Database Settings
     DB_FILE = 'InDMDevDBShop.db'
     DB_BACKUP_INTERVAL = 3600  # 1 hour in seconds
-    
+
     # Payment Settings
     NOWPAYMENTS_API_BASE = 'https://api.nowpayments.io/v1'
+    NOWPAYMENTS_API_KEY = os.getenv('NOWPAYMENTS_API_KEY')
     COINGECKO_API_BASE = 'https://api.coingecko.com/api/v3'
+    DEFAULT_PAYMENT_METHOD = os.getenv('DEFAULT_PAYMENT_METHOD', 'Litecoin')
     
     # Security Settings
     MAX_LOGIN_ATTEMPTS = 5
@@ -67,28 +73,28 @@ class BotConfig:
     MAX_ORDERS_PER_USER_PER_DAY = 10
     
     @classmethod
-    def validate_config(cls):
+    def validate_config(cls) -> bool:
         """Validate configuration settings"""
         errors = []
-        
+
         if not cls.BOT_TOKEN:
             errors.append("TELEGRAM_BOT_TOKEN is not set")
-        
+
         if not cls.WEBHOOK_URL:
             errors.append("NGROK_HTTPS_URL is not set")
-        
+
         if errors:
             raise ValueError(f"Configuration errors: {', '.join(errors)}")
-        
+
         return True
-    
+
     @classmethod
-    def get_db_url(cls):
+    def get_db_url(cls) -> str:
         """Get database connection URL"""
         return f"sqlite:///{cls.DB_FILE}"
-    
+
     @classmethod
-    def get_log_config(cls):
+    def get_log_config(cls) -> Dict[str, object]:
         """Get logging configuration"""
         return {
             'level': cls.LOG_LEVEL,
@@ -96,6 +102,16 @@ class BotConfig:
             'maxBytes': cls.LOG_MAX_SIZE,
             'backupCount': cls.LOG_BACKUP_COUNT
         }
+
+    @classmethod
+    def get_nowpayments_key(cls, fallback: Optional[str] = None) -> Optional[str]:
+        """Return the configured NOWPayments API key.
+
+        A fallback value can be provided for deployments that keep the key in
+        the database rather than an environment variable.
+        """
+
+        return cls.NOWPAYMENTS_API_KEY or fallback
 
 class APIConfig:
     """API configuration settings"""
@@ -113,7 +129,7 @@ class APIConfig:
     RETRY_DELAY = 1  # seconds
     
     @classmethod
-    def get_headers(cls, api_key=None):
+    def get_headers(cls, api_key: Optional[str] = None) -> Dict[str, str]:
         """Get standard API headers"""
         headers = {
             'Content-Type': 'application/json',
@@ -170,10 +186,3 @@ class SecurityConfig:
 
 # Default configuration instance
 config = BotConfig()
-
-# Validate configuration on import
-try:
-    config.validate_config()
-except ValueError as e:
-    print(f"Configuration error: {e}")
-    exit(1)

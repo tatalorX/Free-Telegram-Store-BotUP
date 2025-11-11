@@ -1,37 +1,55 @@
 import flask
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-import requests
 import time
 import logging
-from flask_session import Session
+from logging.handlers import RotatingFileHandler
 import telebot
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from telebot import types
 import random
 import os
 import os.path
 import re
+from typing import Optional
+
 from InDMDevDB import *
 from purchase import *
 from InDMCategories import *
 from telebot.types import LabeledPrice, PreCheckoutQuery, SuccessfulPayment, ShippingOption
-import json
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv('config.env')
+from config import BotConfig
+from services import CoinGeckoClient, CoinGeckoError, NowPaymentsClient, NowPaymentsError
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
+
+def configure_logging() -> logging.Logger:
+    """Initialise a rotating file logger for the bot."""
+
+    log_config = BotConfig.get_log_config()
+    handlers = [
+        RotatingFileHandler(
+            log_config['filename'],
+            maxBytes=log_config['maxBytes'],
+            backupCount=log_config['backupCount'],
+        ),
+        logging.StreamHandler(),
     ]
-)
-logger = logging.getLogger(__name__)
+
+    logging.basicConfig(
+        level=log_config['level'],
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+    )
+    return logging.getLogger(__name__)
+
+
+logger = configure_logging()
+
+try:
+    BotConfig.validate_config()
+except ValueError as config_error:
+    logger.error("Configuration error: %s", config_error)
+    raise SystemExit(config_error) from config_error
 
 # M""M M"""""""`YM M""""""'YMM M"""""`'"""`YM M""""""'YMM MM""""""""`M M""MMMMM""M 
 # M  M M  mmmm.  M M  mmmm. `M M  mm.  mm.  M M  mmmm. `M MM  mmmmmmmM M  MMMMM  M 
@@ -41,18 +59,18 @@ logger = logging.getLogger(__name__)
 # M  M M  MMMMM  M M       .MM M  MMM  MMM  M M       .MM MM        .M M     .dMMM 
 # MMMM MMMMMMMMMMM MMMMMMMMMMM MMMMMMMMMMMMMM MMMMMMMMMMM MMMMMMMMMMMM MMMMMMMMMMM 
 
-# Flask connection 
+# Flask connection
 flask_app = Flask(__name__)
-flask_app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-here')
+flask_app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', os.urandom(24).hex())
 
 # Bot connection
-webhook_url = os.getenv('NGROK_HTTPS_URL')
-bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-store_currency = os.getenv('STORE_CURRENCY', 'USD')
+webhook_url = BotConfig.WEBHOOK_URL
+bot_token = BotConfig.BOT_TOKEN
+store_currency = BotConfig.STORE_CURRENCY
 
 if not webhook_url or not bot_token:
     logger.error("Missing required environment variables: NGROK_HTTPS_URL or TELEGRAM_BOT_TOKEN")
-    exit(1)
+    raise SystemExit("Telegram bot configuration is incomplete")
 
 bot = telebot.TeleBot(bot_token, threaded=False)
 
@@ -85,18 +103,82 @@ def webhook():
         logger.error(f"Error processing webhook: {e}")
         flask.abort(500)
 
-# Initialize payment settings
-def get_payment_api_key():
-    """Get payment API key from database"""
+# Payment integrations
+coin_gecko_client = CoinGeckoClient()
+_nowpayments_client: Optional[NowPaymentsClient] = None
+
+
+def get_payment_api_key() -> Optional[str]:
+    """Fetch the NOWPayments API key from env or the configured payment method."""
+
+    db_key: Optional[str] = None
     try:
-        api_key = GetDataFromDB.GetPaymentMethodTokenKeysCleintID("Bitcoin")
-        return api_key
-    except Exception as e:
-        logger.error(f"Error getting payment API key: {e}")
+        db_key = GetDataFromDB.GetPaymentMethodTokenKeysCleintID(BotConfig.DEFAULT_PAYMENT_METHOD)
+    except Exception as error:  # pragma: no cover - database connectivity issue
+        logger.warning("Unable to read payment credentials from database: %s", error)
+
+    api_key = BotConfig.get_nowpayments_key(db_key)
+    if not api_key:
+        logger.error(
+            "NOWPayments API key missing. Set NOWPAYMENTS_API_KEY or configure '%s' in PaymentMethodTable.",
+            BotConfig.DEFAULT_PAYMENT_METHOD,
+        )
+    return api_key
+
+
+def get_nowpayments_client() -> Optional[NowPaymentsClient]:
+    """Return a lazily constructed NOWPayments client."""
+
+    global _nowpayments_client
+    if _nowpayments_client is None:
+        api_key = get_payment_api_key()
+        if not api_key:
+            return None
+        try:
+            _nowpayments_client = NowPaymentsClient(api_key)
+        except NowPaymentsError as error:
+            logger.error("Failed to initialise NOWPayments client: %s", error)
+            _nowpayments_client = None
+    return _nowpayments_client
+
+
+def convert_to_crypto_amount(fiat_amount: Decimal, currency: str, crypto_symbol: str) -> Optional[Decimal]:
+    """Convert the provided fiat amount to the requested cryptocurrency."""
+
+    try:
+        return coin_gecko_client.convert_to_crypto(fiat_amount, currency, crypto_symbol)
+    except CoinGeckoError as error:
+        logger.error("Unable to fetch %s price: %s", crypto_symbol.upper(), error)
         return None
 
-NOWPAYMENTS_API_KEY = get_payment_api_key()
-BASE_CURRENCY = store_currency
+
+def create_payment_invoice(
+    price_amount: Decimal,
+    price_currency: str,
+    pay_currency: str,
+    description: str,
+    order_id: Optional[str] = None,
+):
+    """Create a NOWPayments invoice using the configured credentials."""
+
+    client = get_nowpayments_client()
+    if not client:
+        raise NowPaymentsError("NOWPayments client is not configured")
+    return client.create_invoice(price_amount, price_currency, pay_currency, description, order_id)
+
+
+def fetch_payment_status(payment_id: str) -> Optional[str]:
+    """Retrieve the status of an invoice from NOWPayments."""
+
+    client = get_nowpayments_client()
+    if not client:
+        logger.error("NOWPayments client not available while checking status for %s", payment_id)
+        return None
+    try:
+        return client.get_payment_status(payment_id)
+    except NowPaymentsError as error:
+        logger.error("Failed to fetch payment status for %s: %s", payment_id, error)
+        return None
 
 
 # Create main keyboard
@@ -160,8 +242,6 @@ def products_get(message):
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     try:
-        print(NOWPAYMENTS_API_KEY)
-        1==1
         try:
             id = message.from_user.id
             usname = message.chat.username
@@ -632,83 +712,6 @@ def shop_items(message):
 # Dictionary to store Bitcoin payment data
 bitcoin_payment_data = {}
 
-CRYPTO_PRICE_IDS = {
-    'btc': 'bitcoin',
-    'ltc': 'litecoin'
-}
-
-
-def get_crypto_amount(fiat_amount, currency, crypto_symbol):
-    """Convert fiat amount to the target crypto amount using CoinGecko"""
-    try:
-        crypto_id = CRYPTO_PRICE_IDS.get(crypto_symbol.lower())
-        if not crypto_id:
-            logger.error(f"Unsupported crypto symbol: {crypto_symbol}")
-            return None
-        url = f'https://api.coingecko.com/api/v3/simple/price?ids={crypto_id}&vs_currencies={currency.lower()}'
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            price = response.json()[crypto_id][currency.lower()]
-            amount_decimal = Decimal(str(fiat_amount)) / Decimal(str(price))
-            return float(round(amount_decimal, 8))
-        logger.error(f"Error fetching {crypto_symbol.upper()} price: {response.status_code} - {response.text}")
-        return None
-    except (requests.RequestException, KeyError, InvalidOperation) as error:
-        logger.error(f"Error converting {currency} to {crypto_symbol.upper()}: {error}")
-        return None
-
-
-def get_btc_amount(fiat_amount, currency):
-    return get_crypto_amount(fiat_amount, currency, 'btc')
-
-
-def get_ltc_amount(fiat_amount, currency):
-    return get_crypto_amount(fiat_amount, currency, 'ltc')
-
-
-def create_payment_address(amount, price_currency, pay_currency, description='Payment for Order', order_id=None):
-    """Create a payment address via the NowPayments API"""
-    if not NOWPAYMENTS_API_KEY:
-        logger.error("NOWPayments API key is not configured")
-        return None, None
-
-    url = 'https://api.nowpayments.io/v1/payment'
-    headers = {
-        'x-api-key': NOWPAYMENTS_API_KEY,
-        'Content-Type': 'application/json'
-    }
-    data = {
-        'price_amount': amount,
-        'price_currency': price_currency.lower(),
-        'pay_currency': pay_currency.lower(),
-        'order_description': description
-    }
-    if order_id:
-        data['order_id'] = str(order_id)
-
-    try:
-        response = requests.post(url, json=data, headers=headers, timeout=15)
-        if response.status_code == 201:
-            payload = response.json()
-            return payload.get('pay_address'), payload.get('payment_id')
-        logger.error(f"Error creating payment address: {response.status_code} - {response.text}")
-    except requests.RequestException as error:
-        logger.error(f"Request error when creating payment address: {error}")
-    return None, None
-    
-# Function to check the payment status
-def check_payment_status(payment_id):
-    url = f'https://api.nowpayments.io/v1/payment/{payment_id}'
-    headers = {
-        'x-api-key': NOWPAYMENTS_API_KEY
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()['payment_status']
-    else:
-        print(f"Error checking payment status: {response.status_code} - {response.text}")
-        return None
-
 
 # Command handler to add funds using Litecoin
 @bot.message_handler(content_types=["text"], func=lambda message: message.text == "Add Funds 💵")
@@ -742,27 +745,64 @@ def process_wallet_top_up(message):
     amount = amount.quantize(Decimal('0.01'))
     CreateDatas.AddAuser(user_id, username)
 
-    ltc_amount = get_ltc_amount(float(amount), store_currency)
-    if not ltc_amount:
-        bot.send_message(message.chat.id, "Unable to calculate LTC amount right now. Please try again later.",
-                         reply_markup=keyboard)
+    if convert_to_crypto_amount(amount, store_currency, 'ltc') is None:
+        bot.send_message(
+            message.chat.id,
+            "Unable to calculate LTC amount right now. Please try again later.",
+            reply_markup=keyboard,
+        )
         return
 
     order_reference = f"wallet_{user_id}_{int(time.time())}"
-    payment_address, payment_id = create_payment_address(
-        ltc_amount,
-        'ltc',
-        'ltc',
-        description=f'Wallet top-up for {user_id}',
-        order_id=order_reference
-    )
+    invoice = None
+    max_attempts = 5
+    attempt = 0
 
-    if not payment_address or not payment_id:
-        bot.send_message(message.chat.id, "Unable to create a payment invoice. Please try again later.",
-                         reply_markup=keyboard)
+    while attempt < max_attempts:
+        attempt_order_id = f"{order_reference}_{attempt}" if attempt else order_reference
+        try:
+            candidate_invoice = create_payment_invoice(
+                amount,
+                store_currency,
+                'ltc',
+                description=f'Wallet top-up for {user_id}',
+                order_id=attempt_order_id,
+            )
+        except NowPaymentsError as error:
+            logger.error("Unable to create NOWPayments invoice: %s", error)
+            break
+
+        if not CreateDatas.WalletAddressExists(candidate_invoice.pay_address, 'ltc'):
+            invoice = candidate_invoice
+            break
+
+        logger.warning(
+            "Duplicate LTC payment address %s detected for user %s. Retrying generation (attempt %s/%s).",
+            candidate_invoice.pay_address,
+            user_id,
+            attempt + 1,
+            max_attempts
+        )
+        attempt += 1
+        time.sleep(0.5)
+
+    if not invoice or CreateDatas.WalletAddressExists(invoice.pay_address, 'ltc'):
+        bot.send_message(
+            message.chat.id,
+            "Unable to create a payment invoice. Please try again later.",
+            reply_markup=keyboard,
+        )
         return
 
-    created = CreateDatas.AddWalletTopUp(user_id, username, float(amount), ltc_amount, 'ltc', payment_id, payment_address)
+    created = CreateDatas.AddWalletTopUp(
+        user_id,
+        username,
+        float(amount),
+        float(invoice.pay_amount),
+        'ltc',
+        invoice.payment_id,
+        invoice.pay_address,
+    )
     if not created:
         bot.send_message(message.chat.id,
                          "You already have this payment pending or an error occurred. Please use the status button to check.",
@@ -776,13 +816,18 @@ def process_wallet_top_up(message):
 
     bot.send_message(
         message.chat.id,
-        (f"Send exactly {Decimal(str(ltc_amount)).quantize(Decimal('0.00000001'))} LTC "
-         f"(approximately {amount} {store_currency}) to the following address:"),
+        (f"Send exactly {invoice.pay_amount.quantize(Decimal('0.00000001'))} LTC "
+         f"(approximately {amount} {store_currency}) to the following temporary address:"),
         reply_markup=reply_keyboard
     )
-    bot.send_message(message.chat.id, f"`{payment_address}`", reply_markup=reply_keyboard, parse_mode='Markdown')
-    bot.send_message(message.chat.id, "After payment, tap on *Check LTC Payment Status ⌛* to confirm.",
-                     reply_markup=reply_keyboard, parse_mode='Markdown')
+    bot.send_message(message.chat.id, f"`{invoice.pay_address}`", reply_markup=reply_keyboard, parse_mode='Markdown')
+    bot.send_message(
+        message.chat.id,
+        ("This address is temporary and will change after your payment is processed."
+         "\nAfter payment, tap on *Check LTC Payment Status ⌛* to confirm."),
+        reply_markup=reply_keyboard,
+        parse_mode='Markdown'
+    )
 
 
 @bot.message_handler(content_types=["text"], func=lambda message: message.text == "Check LTC Payment Status ⌛")
@@ -795,7 +840,7 @@ def check_wallet_top_up_status(message):
         return
 
     for payment_id, fiat_amount, crypto_amount, crypto_currency, payment_address, status in pending:
-        payment_status = check_payment_status(payment_id)
+        payment_status = fetch_payment_status(payment_id)
         if not payment_status:
             bot.send_message(message.chat.id,
                              f"Unable to retrieve payment status for {payment_id}. Please try again later.")
@@ -803,7 +848,7 @@ def check_wallet_top_up_status(message):
 
         normalized_status = payment_status.lower()
         if normalized_status == 'finished':
-            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'finished')
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'finished', 'used')
             CreateDatas.IncrementUserWallet(user_id, float(fiat_amount))
             new_balance = GetDataFromDB.GetUserWalletInDB(user_id)
             bot.send_message(
@@ -812,14 +857,14 @@ def check_wallet_top_up_status(message):
                  f"Your new balance is {new_balance} {store_currency}.")
             )
         elif normalized_status in ['waiting', 'confirming', 'sending']:
-            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'waiting')
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, 'waiting', 'temporary')
             bot.send_message(
                 message.chat.id,
                 (f"Payment {payment_id} is still processing ({payment_status}).\n"
                  "Please check again in a few minutes.")
             )
         else:
-            CreateDatas.UpdateWalletTopUpStatus(payment_id, normalized_status)
+            CreateDatas.UpdateWalletTopUpStatus(payment_id, normalized_status, 'expired')
             bot.send_message(
                 message.chat.id,
                 (f"Payment {payment_id} returned status '{payment_status}'.\n"
@@ -846,48 +891,76 @@ def bitcoin_pay_command(message):
             bot.send_message(id, "This Item is soldout !!!", reply_markup=keyboard, parse_mode="Markdown")
         else:
             try:
-                fiat_amount = new_order[2]
-                btc_amount = get_btc_amount(fiat_amount, store_currency)
+                fiat_amount = Decimal(str(new_order[2])).quantize(Decimal('0.01'))
+                if convert_to_crypto_amount(fiat_amount, store_currency, 'btc') is None:
+                    bot.send_message(message.chat.id, "Error converting amount to BTC. Please try again later.")
+                    return
                 ordernumber = random.randint(10000,99999)
-                if btc_amount:
-                    payment_address, payment_id = create_payment_address(
-                        btc_amount,
-                        'btc',
+                try:
+                    invoice = create_payment_invoice(
+                        fiat_amount,
+                        store_currency,
                         'btc',
                         description=f'Product order {ordernumber}',
-                        order_id=f'order_{ordernumber}'
+                        order_id=f'order_{ordernumber}',
                     )
-                    if payment_address and payment_id:
-                        bitcoin_payment_data[message.from_user.id] = {
-                            'payment_id': payment_id,
-                            'address': payment_address,
-                            'status': 'waiting',
-                            'fiat_amount': fiat_amount,
-                            'btc_amount': btc_amount
-                        }
-                        try:
-                            now = datetime.now()
-                            orderdate = now.strftime("%Y-%m-%d %H:%M:%S")
-                            paidmethod = "NO"
-                            add_key = "NIL"
-                            productdownloadlink = GetDataFromDB.GetProductDownloadLink(new_orders[0])
+                except NowPaymentsError as error:
+                    logger.error("Unable to create BTC payment invoice: %s", error)
+                    bot.send_message(message.chat.id, "Error creating payment address. Please try again later.")
+                    return
 
-                            CreateDatas.AddOrder(id, username,new_orders[1], new_orders[2], orderdate, paidmethod, productdownloadlink, add_key, ordernumber, new_orders[0], payment_id)
-                        except Exception as e:
-                            print(e)
-                            pass
-                        keyboard2 = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-                        keyboard2.row_width = 2
-                        key1 = types.KeyboardButton(text="Check Payment Status ⌛")
-                        keyboard2.add(key1)
-                        bot.send_message(id, f"Please send extact {btc_amount:.8f} BTC (approximately {fiat_amount} {store_currency}) to the following Bitcoin", reply_markup=types.ReplyKeyboardRemove())
-                        bot.send_message(message.chat.id, f"Address: `{payment_address}`", reply_markup=keyboard2, parse_mode='Markdown')
-                        bot.send_message(message.chat.id, f"Please stay on this page and click on Check Payment Status ⌛ button until payment is confirmed", reply_markup=keyboard2, parse_mode='Markdown')
+                bitcoin_payment_data[message.from_user.id] = {
+                    'payment_id': invoice.payment_id,
+                    'address': invoice.pay_address,
+                    'status': 'waiting',
+                    'fiat_amount': float(fiat_amount),
+                    'btc_amount': float(invoice.pay_amount),
+                }
+                try:
+                    now = datetime.now()
+                    orderdate = now.strftime("%Y-%m-%d %H:%M:%S")
+                    paidmethod = "NO"
+                    add_key = "NIL"
+                    productdownloadlink = GetDataFromDB.GetProductDownloadLink(new_orders[0])
 
-                    else:
-                        bot.send_message(message.chat.id, "Error creating payment address. Please try again later.\n\nOR Amount value is too small")
-                else:
-                    bot.send_message(message.chat.id, "Error converting amount to BTC. Please try again later.")
+                    CreateDatas.AddOrder(
+                        id,
+                        username,
+                        new_orders[1],
+                        new_orders[2],
+                        orderdate,
+                        paidmethod,
+                        productdownloadlink,
+                        add_key,
+                        ordernumber,
+                        new_orders[0],
+                        invoice.payment_id,
+                    )
+                except Exception as e:
+                    logger.error("Error storing order data: %s", e)
+
+                keyboard2 = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+                keyboard2.row_width = 2
+                key1 = types.KeyboardButton(text="Check Payment Status ⌛")
+                keyboard2.add(key1)
+                bot.send_message(
+                    id,
+                    (f"Please send exact {invoice.pay_amount.quantize(Decimal('0.00000001'))} BTC "
+                     f"(approximately {fiat_amount} {store_currency}) to the following Bitcoin address."),
+                    reply_markup=types.ReplyKeyboardRemove(),
+                )
+                bot.send_message(
+                    message.chat.id,
+                    f"Address: `{invoice.pay_address}`",
+                    reply_markup=keyboard2,
+                    parse_mode='Markdown',
+                )
+                bot.send_message(
+                    message.chat.id,
+                    "Please stay on this page and click on Check Payment Status ⌛ button until payment is confirmed",
+                    reply_markup=keyboard2,
+                    parse_mode='Markdown',
+                )
             except (IndexError, ValueError):
                 bot.send_message(message.chat.id, f"Invalid command.")
 
@@ -900,7 +973,7 @@ def bitcoin_check_command(message):
         bot.send_message(message.chat.id, "No order found !")
     else:
         for ordernumber, productname, buyerusername, payment_id, productnumber in orders:
-            status = check_payment_status(payment_id)
+            status = fetch_payment_status(payment_id)
             if status:
                 if status == 'finished':
                     try:

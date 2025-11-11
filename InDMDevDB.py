@@ -112,10 +112,20 @@ class CreateTables:
                     payment_id TEXT UNIQUE NOT NULL,
                     payment_address TEXT,
                     status TEXT DEFAULT 'pending',
+                    address_status TEXT DEFAULT 'temporary',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES ShopUserTable(user_id)
                 )""")
+
+                # Ensure address_status column exists for legacy databases
+                cursor.execute("PRAGMA table_info(WalletTopUpTable)")
+                wallet_columns = [row[1] for row in cursor.fetchall()]
+                if 'address_status' not in wallet_columns:
+                    cursor.execute(
+                        "ALTER TABLE WalletTopUpTable ADD COLUMN address_status TEXT DEFAULT 'temporary'"
+                    )
+                    db_connection.commit()
 
                 db_connection.commit()
                 logger.info("All database tables created successfully")
@@ -309,8 +319,8 @@ class CreateDatas:
                 cursor.execute("""
                     INSERT OR IGNORE INTO WalletTopUpTable
                     (user_id, username, fiat_amount, crypto_amount, crypto_currency,
-                     payment_id, payment_address, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                     payment_id, payment_address, status, address_status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'temporary', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, (user_id, username, fiat_amount, crypto_amount, crypto_currency,
                       payment_id, payment_address))
                 db_connection.commit()
@@ -321,21 +331,58 @@ class CreateDatas:
             return False
 
     @staticmethod
-    def UpdateWalletTopUpStatus(payment_id, status):
+    def UpdateWalletTopUpStatus(payment_id, status, address_status=None):
         """Update wallet top-up status"""
         try:
             with db_lock:
-                cursor.execute("""
-                    UPDATE WalletTopUpTable
-                    SET status = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE payment_id = ?
-                """, (status, payment_id))
+                if address_status:
+                    cursor.execute("""
+                        UPDATE WalletTopUpTable
+                        SET status = ?, address_status = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE payment_id = ?
+                    """, (status, address_status, payment_id))
+                else:
+                    cursor.execute("""
+                        UPDATE WalletTopUpTable
+                        SET status = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE payment_id = ?
+                    """, (status, payment_id))
                 db_connection.commit()
                 return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Error updating wallet top-up {payment_id}: {e}")
             db_connection.rollback()
             return False
+
+    @staticmethod
+    def WalletAddressExists(payment_address, crypto_currency=None):
+        """Check if a wallet address is already stored"""
+        try:
+            with db_lock:
+                if crypto_currency:
+                    cursor.execute(
+                        """
+                        SELECT 1
+                        FROM WalletTopUpTable
+                        WHERE payment_address = ? AND crypto_currency = ?
+                        LIMIT 1
+                        """,
+                        (payment_address, crypto_currency)
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT 1
+                        FROM WalletTopUpTable
+                        WHERE payment_address = ?
+                        LIMIT 1
+                        """,
+                        (payment_address,)
+                    )
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Error checking wallet address {payment_address}: {e}")
+            return True
 
     @staticmethod
     def IncrementUserWallet(user_id, amount):
@@ -806,29 +853,27 @@ class GetDataFromDB:
         except Exception as e:
             print(e)
             return None
- 
+
     def GetPaymentMethodTokenKeysCleintID(method_name):
         try:
-            connected.execute(f"SELECT DISTINCT token_keys_clientid FROM PaymentMethodTable WHERE method_name = '{method_name}'")
-            payment_method = connected.fetchone()[0]
-            if payment_method is not None:
-                return payment_method
-            else:
-                return None
+            connected.execute("SELECT DISTINCT token_keys_clientid FROM PaymentMethodTable WHERE method_name = ?", (method_name,))
+            row = connected.fetchone()
+            if row and row[0]:
+                return row[0]
+            return None
         except Exception as e:
-            print(e)
+            logger.error(f"Error fetching payment token for {method_name}: {e}")
             return None
 
     def GetPaymentMethodSecretKeys(method_name):
         try:
-            connected.execute(f"SELECT DISTINCT secret_keys FROM PaymentMethodTable WHERE method_name = '{method_name}'")
-            payment_method = connected.fetchone()[0]
-            if payment_method is not None:
-                return payment_method
-            else:
-                return None
+            connected.execute("SELECT DISTINCT secret_keys FROM PaymentMethodTable WHERE method_name = ?", (method_name,))
+            row = connected.fetchone()
+            if row and row[0]:
+                return row[0]
+            return None
         except Exception as e:
-            print(e)
+            logger.error(f"Error fetching payment secret for {method_name}: {e}")
             return None
 
     @staticmethod
